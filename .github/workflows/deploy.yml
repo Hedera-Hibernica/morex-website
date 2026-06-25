@@ -1,0 +1,48 @@
+name: Deploy to S3 + CloudFront
+
+# Deploys the static site on every push to main.
+# Auth uses GitHub OIDC -> AWS IAM role (no long-lived secrets stored here).
+# Required repo secrets (set after AWS infra is built):
+#   AWS_DEPLOY_ROLE_ARN          - IAM role the workflow assumes via OIDC
+#   S3_BUCKET                    - target bucket name
+#   CLOUDFRONT_DISTRIBUTION_ID   - distribution to invalidate
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Sync site to S3
+        run: |
+          aws s3 sync . "s3://${{ secrets.S3_BUCKET }}" \
+            --delete \
+            --exclude ".git/*" \
+            --exclude ".github/*" \
+            --exclude "README.md" \
+            --cache-control "public,max-age=300"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"

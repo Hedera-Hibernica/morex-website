@@ -1,0 +1,8 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local tooling (kept outside the repo, ignored just in case)
+.venv/
+.idea/
