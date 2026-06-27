@@ -38,6 +38,7 @@ jobs:
             --delete \
             --exclude ".git/*" \
             --exclude ".github/*" \
+            --exclude "infra/*" \
             --exclude "README.md" \
             --cache-control "public,max-age=300"
 

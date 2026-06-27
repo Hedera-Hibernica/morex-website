@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Morex static site hosting: private S3 bucket served via CloudFront (OAC) with
+  HTTPS from an ACM cert, Route 53 alias records for the apex and www (www -> apex
+  301 redirect), and a GitHub OIDC-federated IAM role for the deploy workflow.
+  Deploy this stack in us-east-1 (CloudFront requires its ACM cert there).
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: morex.network
+    Description: Apex domain the site is served from.
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID for the apex domain.
+  BucketName:
+    Type: String
+    Default: morex-network-site
+    Description: Globally-unique name for the private site bucket.
+  GitHubRepo:
+    Type: String
+    Default: Hedera-Hibernica/morex-website
+    Description: owner/repo allowed to assume the deploy role via OIDC.
+  CreateOIDCProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Create the GitHub OIDC provider. Set to "false" if the account already has
+      an iam OIDC provider for token.actions.githubusercontent.com.
+  ManageApexDns:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Create the apex + www Route 53 alias records pointing at CloudFront. Set to
+      "false" for an initial build (so existing records stay live), then "true" to
+      cut the domain over once CloudFront is serving the site.
+
+Conditions:
+  ShouldCreateOIDCProvider: !Equals [!Ref CreateOIDCProvider, "true"]
+  ShouldManageApexDns: !Equals [!Ref ManageApexDns, "true"]
+
+Resources:
+  # ---------------------------------------------------------------- S3 (private)
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOACRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # --------------------------------------------------------------- ACM (us-east-1)
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub "www.${DomainName}"
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+        - DomainName: !Sub "www.${DomainName}"
+          HostedZoneId: !Ref HostedZoneId
+
+  # ---------------------------------------------------- CloudFront access + redirect
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${BucketName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WwwRedirectFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${AWS::StackName}-www-redirect"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Redirect www.<domain> to the apex domain (301).
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub |
+        function handler(event) {
+          var request = event.request;
+          var host = request.headers.host.value;
+          if (host === 'www.${DomainName}') {
+            return {
+              statusCode: 301,
+              statusDescription: 'Moved Permanently',
+              headers: {
+                location: { value: 'https://${DomainName}' + request.uri }
+              }
+            };
+          }
+          return request;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "Morex site - ${DomainName}"
+        Aliases:
+          - !Ref DomainName
+          - !Sub "www.${DomainName}"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed "CachingOptimized" policy
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt WwwRedirectFunction.FunctionMetadata.FunctionARN
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+
+  # ------------------------------------------------------------------- Route 53 DNS
+  ApexRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: ShouldManageApexDns
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # fixed CloudFront alias hosted zone
+        EvaluateTargetHealth: false
+
+  ApexRecordIPv6:
+    Type: AWS::Route53::RecordSet
+    Condition: ShouldManageApexDns
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  WwwRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: ShouldManageApexDns
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "www.${DomainName}"
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  WwwRecordIPv6:
+    Type: AWS::Route53::RecordSet
+    Condition: ShouldManageApexDns
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "www.${DomainName}"
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  # -------------------------------------------------- GitHub OIDC -> IAM deploy role
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bba010962f209020e1d4ef84f99e94
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-github-deploy"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOIDCProvider
+                - !Ref GitHubOIDCProvider
+                - !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepo}:ref:refs/heads/main"
+      Policies:
+        - PolicyName: deploy-site
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SyncBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt SiteBucket.Arn
+              - Sid: WriteObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${SiteBucket.Arn}/*"
+              - Sid: InvalidateCache
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+Outputs:
+  BucketName:
+    Description: S3 bucket holding the site (set as the S3_BUCKET secret).
+    Value: !Ref SiteBucket
+  DistributionId:
+    Description: CloudFront distribution ID (set as CLOUDFRONT_DISTRIBUTION_ID).
+    Value: !Ref Distribution
+  CloudFrontDomainName:
+    Description: CloudFront domain the Route 53 aliases point to.
+    Value: !GetAtt Distribution.DomainName
+  DeployRoleArn:
+    Description: IAM role the GitHub workflow assumes (set as AWS_DEPLOY_ROLE_ARN).
+    Value: !GetAtt DeployRole.Arn
