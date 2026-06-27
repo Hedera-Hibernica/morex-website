@@ -36,6 +36,14 @@ Parameters:
       Create the apex + www Route 53 alias records pointing at CloudFront. Set to
       "false" for an initial build (so existing records stay live), then "true" to
       cut the domain over once CloudFront is serving the site.
+  AdminEmail:
+    Type: String
+    Default: admin@morex.network
+    Description: Where "Register your interest" form submissions are emailed.
+  MailFrom:
+    Type: String
+    Default: noreply@morex.network
+    Description: SES From address for form emails (must be on the site domain).
 
 Conditions:
   ShouldCreateOIDCProvider: !Equals [!Ref CreateOIDCProvider, "true"]
@@ -142,6 +150,11 @@ Resources:
             OriginAccessControlId: !GetAtt OriginAccessControl.Id
             S3OriginConfig:
               OriginAccessIdentity: ""
+          - Id: FormApiOrigin
+            DomainName: !Sub "${FormHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
         DefaultCacheBehavior:
           TargetOriginId: S3Origin
           ViewerProtocolPolicy: redirect-to-https
@@ -153,6 +166,16 @@ Resources:
           FunctionAssociations:
             - EventType: viewer-request
               FunctionARN: !GetAtt WwwRedirectFunction.FunctionMetadata.FunctionARN
+        CacheBehaviors:
+          # Form API: forward POSTs to API Gateway, never cache.
+          - PathPattern: /api/*
+            TargetOriginId: FormApiOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            # Managed "CachingDisabled" + "AllViewerExceptHostHeader" policies
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
         ViewerCertificate:
           AcmCertificateArn: !Ref Certificate
           SslSupportMethod: sni-only
@@ -260,6 +283,175 @@ Resources:
                 Action:
                   - cloudfront:CreateInvalidation
                 Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # ----------------------------------------- Interest form: SES + Lambda + API GW
+  # SES domain identity with Easy DKIM. Verifying the domain lets us send FROM
+  # noreply@<domain> and (in the SES sandbox) TO admin@<domain> with no support request.
+  SesDomainIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref DomainName
+      DkimAttributes:
+        SigningEnabled: true
+
+  SesDkimRecord1:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt SesDomainIdentity.DkimDNSTokenName1
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords: [!GetAtt SesDomainIdentity.DkimDNSTokenValue1]
+
+  SesDkimRecord2:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt SesDomainIdentity.DkimDNSTokenName2
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords: [!GetAtt SesDomainIdentity.DkimDNSTokenValue2]
+
+  SesDkimRecord3:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt SesDomainIdentity.DkimDNSTokenName3
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords: [!GetAtt SesDomainIdentity.DkimDNSTokenValue3]
+
+  FormFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: send-form-email
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ses:SendEmail, ses:SendRawEmail]
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    ses:FromAddress: !Ref MailFrom
+
+  FormFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-interest-form"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 128
+      Role: !GetAtt FormFunctionRole.Arn
+      Environment:
+        Variables:
+          ADMIN_EMAIL: !Ref AdminEmail
+          MAIL_FROM: !Ref MailFrom
+      Code:
+        ZipFile: |
+          import json, os, base64
+          from urllib.parse import parse_qs
+          import boto3
+
+          ses = boto3.client("ses")
+          ADMIN = os.environ["ADMIN_EMAIL"]
+          SENDER = os.environ["MAIL_FROM"]
+          FIELDS = ["name", "business", "email", "sector", "location", "message"]
+          REQUIRED = ["name", "business", "email", "sector"]
+
+          def _resp(code, body):
+              return {
+                  "statusCode": code,
+                  "headers": {"content-type": "application/json"},
+                  "body": json.dumps(body),
+              }
+
+          def _parse(event):
+              body = event.get("body") or ""
+              if event.get("isBase64Encoded"):
+                  body = base64.b64decode(body).decode("utf-8")
+              ctype = (event.get("headers") or {}).get("content-type", "")
+              if "application/json" in ctype:
+                  return json.loads(body or "{}")
+              return {k: v[0] for k, v in parse_qs(body).items()}
+
+          def handler(event, context):
+              try:
+                  data = _parse(event)
+              except Exception:
+                  return _resp(400, {"error": "bad request"})
+              # Honeypot: bots fill this hidden field; humans never see it.
+              if (data.get("company_website") or "").strip():
+                  return _resp(200, {"ok": True})
+              missing = [f for f in REQUIRED if not (data.get(f) or "").strip()]
+              if missing:
+                  return _resp(400, {"error": "missing fields", "fields": missing})
+              lines = []
+              for f in FIELDS:
+                  v = (data.get(f) or "").strip()
+                  if v:
+                      lines.append(f"{f.capitalize()}: {v}")
+              text = "New interest registration via morex.network\n\n" + "\n".join(lines)
+              try:
+                  ses.send_email(
+                      Source=f"Morex Network <{SENDER}>",
+                      Destination={"ToAddresses": [ADMIN]},
+                      ReplyToAddresses=[data["email"].strip()] if data.get("email") else [],
+                      Message={
+                          "Subject": {"Data": ("New interest: " + (data.get("business") or "").strip())[:200]},
+                          "Body": {"Text": {"Data": text}},
+                      },
+                  )
+              except Exception as e:
+                  print("SES send error:", repr(e))
+                  return _resp(502, {"error": "send failed"})
+              return _resp(200, {"ok": True})
+
+  FormHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-form-api"
+      ProtocolType: HTTP
+
+  FormIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref FormHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt FormFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  FormRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref FormHttpApi
+      RouteKey: "POST /api/interest"
+      Target: !Sub "integrations/${FormIntegration}"
+
+  FormStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref FormHttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  FormLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FormFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FormHttpApi}/*/*/api/interest"
 
 Outputs:
   BucketName:

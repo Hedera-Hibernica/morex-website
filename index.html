@@ -301,8 +301,8 @@ body{font-family:'Lora',Georgia,serif;color:var(--body);line-height:1.7;backgrou
   <span class="sec-label" style="color:var(--green-light);">Get involved</span>
   <h2 style="font-family:'Ubuntu Sans',sans-serif;font-size:clamp(2rem,4vw,2.8rem);font-weight:700;color:#fff;letter-spacing:-0.02em;line-height:1.1;margin-bottom:0.75rem;">Register your interest</h2>
   <p style="font-family:'Lora',serif;color:#ffffff;font-size:0.95rem;font-style:italic;margin-bottom:2.75rem;line-height:1.85;">We are building the network now. Tell us about your business and we will be in touch when Morex Network is ready to launch in Moray.</p>
-  <form style="display:flex;flex-direction:column;gap:0.9rem;" name="interest" method="POST" data-netlify="true" action="/thankyou.html">
-    <input type="hidden" name="form-name" value="interest">
+  <form id="interest-form" style="display:flex;flex-direction:column;gap:0.9rem;" name="interest" method="POST" action="/api/interest">
+    <input type="text" name="company_website" tabindex="-1" autocomplete="off" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0;">
     <div class="form-row" style="display:grid;grid-template-columns:1fr 1fr;gap:0.9rem;">
       <div style="display:flex;flex-direction:column;gap:0.4rem;"><label style="font-family:'Ubuntu Sans',sans-serif;font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.9);">Your name</label><input class="form-input" type="text" name="name" required placeholder="Jane Smith"></div>
       <div style="display:flex;flex-direction:column;gap:0.4rem;"><label style="font-family:'Ubuntu Sans',sans-serif;font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.9);">Business name</label><input class="form-input" type="text" name="business" required placeholder="Moray Joinery Ltd"></div>
@@ -319,6 +319,7 @@ body{font-family:'Lora',Georgia,serif;color:var(--body);line-height:1.7;backgrou
     <div style="display:flex;flex-direction:column;gap:0.4rem;"><label style="font-family:'Ubuntu Sans',sans-serif;font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.9);">Town or area in Moray</label><input class="form-input" type="text" name="location" placeholder="e.g. Forres, Elgin, Findhorn"></div>
     <div style="display:flex;flex-direction:column;gap:0.4rem;"><label style="font-family:'Ubuntu Sans',sans-serif;font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.9);">Anything else? (optional)</label><textarea class="form-textarea" name="message" placeholder="What you offer, what you would like to source locally..." style="color:#fff;"></textarea></div>
     <button class="form-submit" type="submit">Register my interest →</button>
+    <p id="form-status" role="status" aria-live="polite" style="text-align:center;font-family:'Lora',serif;font-size:0.82rem;margin:0.2rem 0 0;min-height:1em;"></p>
     <p style="text-align:center;font-family:'Lora',serif;font-size:0.78rem;color:rgba(255,255,255,0.85);font-style:italic;margin-top:0.75rem;">We will only use your details to contact you about Morex Network.</p>
   </form>
 </div>
@@ -330,5 +331,30 @@ body{font-family:'Lora',Georgia,serif;color:var(--body);line-height:1.7;backgrou
   if(h)h.addEventListener('click',function(){document.getElementById('nav-links').classList.toggle('open');});
   var obs=new IntersectionObserver(function(e){e.forEach(function(x){if(x.isIntersecting)x.target.classList.add('visible');});},{threshold:0.1});
   document.querySelectorAll('.fade-up').forEach(function(el){obs.observe(el);});
+})();
+(function(){
+  var form=document.getElementById('interest-form');
+  if(!form)return;
+  var btn=form.querySelector('.form-submit');
+  var status=document.getElementById('form-status');
+  var label=btn?btn.textContent:'';
+  form.addEventListener('submit',function(e){
+    e.preventDefault();
+    if(btn){btn.disabled=true;btn.textContent='Sending…';}
+    if(status){status.textContent='';status.style.color='';}
+    var data={};
+    new FormData(form).forEach(function(v,k){data[k]=v;});
+    fetch(form.getAttribute('action'),{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(data)
+    }).then(function(r){
+      if(r.ok){window.location.href='/thankyou.html';return;}
+      throw new Error('status '+r.status);
+    }).catch(function(){
+      if(btn){btn.disabled=false;btn.textContent=label;}
+      if(status){status.style.color='#ffd2d2';status.textContent='Sorry, something went wrong — please email admin@morex.network directly.';}
+    });
+  });
 })();
 </script></body></html>
